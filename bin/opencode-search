@@ -3,11 +3,20 @@
 
 declare(strict_types=1);
 
+// opencode-search: full-text search across all OpenCode sessions.
+// Queries the local opencode SQLite database (read-only) and either lists
+// the matching sessions or prints the matching lines of one session.
+
+// Max. number of sessions printed in list mode.
 const DEFAULT_LIMIT   = 20;
+// Context lines around each match in --show mode.
 const DEFAULT_CONTEXT = 2;
+// Lines longer than this are truncated in --show output.
 const MAX_LINE_WIDTH  = 160;
+// Bump on every release.
 const VERSION         = '1.0.0';
 
+// Print an error message and terminate (exit code 2 unless overridden).
 function fail(string $msg, int $code = 2): never
 {
     fwrite(STDERR, 'Error: ' . $msg . "\n");
@@ -47,6 +56,7 @@ Examples:
 TXT;
 }
 
+// Fetch the value that must follow an option; reject missing or flag-like values.
 function needValue(array $args, int $i, string $flag): string
 {
     if (!isset($args[$i]) || str_starts_with($args[$i], '-')) {
@@ -71,6 +81,7 @@ function parseArgs(array $argv): array
         'textOnly'  => false,
     ];
     $args = array_slice($argv, 1);
+    // Tracks whether "--" was seen; only the keyword may follow it.
     $positional = false;
 
     for ($i = 0, $n = count($args); $i < $n; $i++) {
@@ -80,6 +91,7 @@ function parseArgs(array $argv): array
             fail('Unexpected argument: ' . $arg . ' (see --help)');
         }
 
+        // "--" marks the keyword, allowing it to start with a dash.
         if ($arg === '--') {
             $positional = true;
             if ($i + 1 >= $n) {
@@ -135,6 +147,7 @@ function parseArgs(array $argv): array
                 $opts['quiet'] = true;
                 break;
             default:
+                // First non-flag token is the keyword; anything after is an error.
                 if ($opts['keyword'] === null) {
                     $opts['keyword'] = $arg;
 
@@ -144,6 +157,7 @@ function parseArgs(array $argv): array
         }
     }
 
+    // Validate: keyword required, sane ranges, no conflicting modes.
     if ($opts['keyword'] === null || $opts['keyword'] === '') {
         help();
         exit(2);
@@ -161,11 +175,14 @@ function parseArgs(array $argv): array
     return $opts;
 }
 
+// Escape LIKE wildcards so the keyword matches literally (used with ESCAPE '\').
 function escapeLike(string $value): string
 {
     return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $value);
 }
 
+// Convert --since (absolute date or relative "-Nd") to epoch milliseconds;
+// opencode stores times in milliseconds.
 function sinceEpochMs(?string $since): ?int
 {
     if ($since === null) {
@@ -186,6 +203,7 @@ function openDb(): PDO
 {
     $path = null;
 
+    // Prefer the path the opencode binary itself reports...
     $out = @shell_exec('opencode db path 2>/dev/null');
     if ($out !== null && $out !== false) {
         $candidate = trim($out);
@@ -193,18 +211,21 @@ function openDb(): PDO
             $path = $candidate;
         }
     }
+    // ...fall back to the standard location (also used when opencode is not on PATH).
     $path ??= rtrim($_SERVER['HOME'] ?? '', '/') . '/.local/share/opencode/opencode.db';
 
     if (!is_file($path)) {
         fail('Opencode database not found: ' . $path);
     }
 
+    // Open strictly read-only; the tool must never modify the database.
     $db = new PDO('sqlite:file:' . $path . '?mode=ro');
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
     return $db;
 }
 
+// Build the shared WHERE fragments for list queries.
 function filterSql(bool $textOnly, ?string $project, ?int $sinceMs): string
 {
     $sql = '';
@@ -225,6 +246,7 @@ function runList(array $opts, PDO $db): void
 {
     $sinceMs = sinceEpochMs($opts['since']);
 
+    // Count matching parts per session; one row per session.
     $sql = "SELECT s.id, s.title, s.directory, s.time_created, count(*) AS hits
             FROM part p
             JOIN session s ON s.id = p.session_id
@@ -234,6 +256,7 @@ function runList(array $opts, PDO $db): void
              ORDER BY hits DESC, s.time_updated DESC
              LIMIT ' . (int) $opts['limit'];
 
+    // Bind parameters; % and _ in keyword/project stay literal (escapeLike).
     $stmt = $db->prepare($sql);
     $stmt->bindValue(':kw', '%' . escapeLike($opts['keyword']) . '%', PDO::PARAM_STR);
     if ($opts['project'] !== null) {
@@ -246,6 +269,7 @@ function runList(array $opts, PDO $db): void
 
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Output mode: JSON payload for scripting.
     if ($opts['json']) {
         $sessions = array_map(static fn (array $r): array => [
             'created'   => date('c', (int) ($r['time_created'] / 1000)),
@@ -263,6 +287,7 @@ function runList(array $opts, PDO $db): void
         exit($rows ? 0 : 1);
     }
 
+    // Output mode: bare session IDs for pipes.
     if ($opts['quiet']) {
         foreach ($rows as $row) {
             echo $row['id'], "\n";
@@ -271,10 +296,12 @@ function runList(array $opts, PDO $db): void
         exit($rows ? 0 : 1);
     }
 
+    // No matches: exit 1 (documented, scriptable).
     if (!$rows) {
         exit(1);
     }
 
+    // Output mode: human-readable table.
     foreach ($rows as $row) {
         echo str_pad((string) $row['hits'], 6, ' ', STR_PAD_LEFT), '  ',
             date('Y-m-d H:i', (int) ($row['time_created'] / 1000)), '  ',
@@ -288,17 +315,21 @@ function runList(array $opts, PDO $db): void
     exit(0);
 }
 
+// Resolve a session from a full ID or a unique prefix.
 function resolveSession(PDO $db, string $id): ?array
 {
+    // Try the full ID first.
     $stmt = $db->prepare('SELECT id, title FROM session WHERE id = :id');
     $stmt->execute([':id' => $id]);
     if ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         return $row;
     }
+    // Prefix search only for plausible IDs (short prefixes are almost always ambiguous).
     if (strlen($id) < 8) {
         return null;
     }
 
+    // Resolve a unique prefix (LIMIT 2 detects ambiguity).
     $stmt = $db->prepare('SELECT id, title FROM session WHERE id LIKE :prefix LIMIT 2');
     $stmt->execute([':prefix' => $id . '%']);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -312,12 +343,14 @@ function resolveSession(PDO $db, string $id): ?array
         : 'Ambiguous session prefix: ' . $id);
 }
 
+// Wrap every occurrence of the keyword in bold ANSI escapes (TTY output only).
 function highlightLine(string $line, string $kw, bool $color): string
 {
     if (!$color) {
         return $line;
     }
 
+    // Rebuild the line, switching bold on/off around each match.
     $out = '';
     $pos = 0;
     $kwl = mb_strlen($kw);
@@ -330,6 +363,7 @@ function highlightLine(string $line, string $kw, bool $color): string
     return $out . mb_substr($line, $pos);
 }
 
+// Flatten control characters and truncate very long lines.
 function clipLine(string $line): string
 {
     $line = str_replace(["\r", "\t"], ' ', $line);
@@ -340,8 +374,10 @@ function clipLine(string $line): string
     return mb_substr($line, 0, MAX_LINE_WIDTH) . '…';
 }
 
+// Render matching lines with context, a ">" marker, and gap ellipses.
 function printWindows(array $lines, string $kw, int $context, bool $color): void
 {
+    // Collect line indices containing the keyword.
     $hits = [];
     foreach ($lines as $idx => $line) {
         if (stripos($line, $kw) !== false) {
@@ -349,6 +385,7 @@ function printWindows(array $lines, string $kw, int $context, bool $color): void
         }
     }
 
+    // Merge overlapping or adjacent context ranges into windows.
     $windows = [];
     foreach ($hits as $hit) {
         $start = max(0, $hit - $context);
@@ -361,6 +398,7 @@ function printWindows(array $lines, string $kw, int $context, bool $color): void
         }
     }
 
+    // Print each window; insert an ellipsis when lines are skipped between windows.
     $width = (string) count($lines);
     $last  = null;
     foreach ($windows as [$start, $end]) {
@@ -379,6 +417,7 @@ function printWindows(array $lines, string $kw, int $context, bool $color): void
 
 function runShow(array $opts, PDO $db): void
 {
+    // Resolve the target session (full ID or unique prefix).
     $session = resolveSession($db, $opts['show']);
     if ($session === null) {
         fail('Session not found: ' . $opts['show']);
@@ -386,6 +425,7 @@ function runShow(array $opts, PDO $db): void
 
     $sinceMs = sinceEpochMs($opts['since']);
 
+    // Fetch matching parts of that session; the message role drives the label.
     $sql = "SELECT p.id, p.data, p.time_created, json_extract(m.data, '\$.role') AS role
             FROM part p
             JOIN message m ON m.id = p.message_id
@@ -408,6 +448,7 @@ function runShow(array $opts, PDO $db): void
 
     $parts = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
+    // Session header.
     echo $session['id'], ' — ', $session['title'], "\n";
     echo str_repeat('─', max(40, mb_strlen($session['id'] . ' — ' . $session['title']))), "\n";
 
@@ -417,8 +458,11 @@ function runShow(array $opts, PDO $db): void
         exit(1);
     }
 
+    // Color output only when stdout is a terminal.
     $color = function_exists('stream_isatty') && @stream_isatty(STDOUT);
     $shown = 0;
+
+    // Extract display text and a role label from each part's JSON.
     foreach ($parts as $part) {
         $data = json_decode((string) $part['data'], true);
         if (!is_array($data)) {
@@ -439,6 +483,7 @@ function runShow(array $opts, PDO $db): void
             $label = $type !== '' ? $type : $role;
         }
 
+        // Skip parts without extractable text.
         if ($text === '') {
             continue;
         }
@@ -448,6 +493,7 @@ function runShow(array $opts, PDO $db): void
         printWindows(preg_split('/\n/', $text), (string) $opts['keyword'], $opts['context'], $color);
     }
 
+    // Matches existed but none could be rendered (e.g. non-extractable parts).
     if ($shown === 0) {
         echo 'No displayable matches (matches are in non-extractable parts).', "\n";
     }
@@ -460,6 +506,7 @@ function main(array $argv): void
     $opts = parseArgs($argv);
     $db   = openDb();
 
+    // Show mode exits internally; list mode is the fallback.
     if ($opts['show'] !== null) {
         runShow($opts, $db);
     }
