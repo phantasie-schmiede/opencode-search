@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-php@v5
+        with:
+          php-version: '8.3'
+          extensions: pdo_sqlite, mbstring
+
+      - name: Syntax check
+        run: php -l bin/opencode-search
+
+      - name: Smoke test
+        run: php tests/smoke.php

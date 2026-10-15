@@ -1,0 +1,464 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+const DEFAULT_LIMIT   = 20;
+const DEFAULT_CONTEXT = 2;
+const MAX_LINE_WIDTH  = 160;
+
+function fail(string $msg, int $code = 2): never
+{
+    fwrite(STDERR, 'Error: ' . $msg . "\n");
+    exit($code);
+}
+
+function help(): void
+{
+    echo <<<TXT
+opencode-search – full-text search across all OpenCode sessions
+
+Usage:
+  opencode-search <keyword> [options]
+  opencode-search -- <keyword starting with ->
+
+Options:
+  -s, --show SESSID    Show matching lines of a session with context
+                       (SESSID: full ID or unique prefix)
+  -l, --limit N        Max. number of sessions in the list (default: 20)
+  -c, --context N      Context lines per match for --show (default: 2)
+      --text-only      Search text parts only (no tool output)
+  -p, --project DIR    Filter by project/directory name (substring)
+      --since DATE     Only sessions from DATE on (YYYY-MM-DD or -Nd, e.g. -14d)
+      --json           Output as JSON (list mode only)
+      --resume         Show the opencode --session command per session
+  -q, --quiet          Print session IDs only
+  -h, --help           This help
+
+Exit status:  0 = matches found, 1 = no matches, 2 = error
+
+Examples:
+  opencode-search "asset:publish"
+  opencode-search "asset:publish" --since -7d --resume
+  opencode-search "Could not determine path" --show ses_ec4671
+  opencode-search vendor/bin/crafter --json
+TXT;
+}
+
+function needValue(array $args, int $i, string $flag): string
+{
+    if (!isset($args[$i]) || str_starts_with($args[$i], '-')) {
+        fail('Option ' . $flag . ' requires a value');
+    }
+
+    return $args[$i];
+}
+
+function parseArgs(array $argv): array
+{
+    $opts = [
+        'context'   => DEFAULT_CONTEXT,
+        'json'      => false,
+        'keyword'   => null,
+        'limit'     => DEFAULT_LIMIT,
+        'project'   => null,
+        'quiet'     => false,
+        'resume'    => false,
+        'show'      => null,
+        'since'     => null,
+        'textOnly'  => false,
+    ];
+    $args = array_slice($argv, 1);
+    $positional = false;
+
+    for ($i = 0, $n = count($args); $i < $n; $i++) {
+        $arg = $args[$i];
+
+        if ($positional) {
+            fail('Unexpected argument: ' . $arg . ' (see --help)');
+        }
+
+        if ($arg === '--') {
+            $positional = true;
+            if ($i + 1 >= $n) {
+                fail('Missing search keyword');
+            }
+            $opts['keyword'] = $args[++$i];
+
+            continue;
+        }
+
+        switch ($arg) {
+            case '-h':
+            case '--help':
+                help();
+                exit(0);
+            case '-s':
+            case '--show':
+                $opts['show'] = needValue($args, ++$i, $arg);
+                break;
+            case '-l':
+            case '--limit':
+                $opts['limit'] = (int) needValue($args, ++$i, $arg);
+                break;
+            case '-c':
+            case '--context':
+                $opts['context'] = (int) needValue($args, ++$i, $arg);
+                break;
+            case '-p':
+            case '--project':
+                $opts['project'] = needValue($args, ++$i, $arg);
+                break;
+            case '--since':
+                if (!isset($args[$i + 1])) {
+                    fail('Option --since requires a value');
+                }
+                $opts['since'] = $args[++$i];
+                break;
+            case '--text-only':
+                $opts['textOnly'] = true;
+                break;
+            case '--json':
+                $opts['json'] = true;
+                break;
+            case '--resume':
+                $opts['resume'] = true;
+                break;
+            case '-q':
+            case '--quiet':
+                $opts['quiet'] = true;
+                break;
+            default:
+                if ($opts['keyword'] === null) {
+                    $opts['keyword'] = $arg;
+
+                    break;
+                }
+                fail('Unexpected argument: ' . $arg . ' (see --help)');
+        }
+    }
+
+    if ($opts['keyword'] === null || $opts['keyword'] === '') {
+        help();
+        exit(2);
+    }
+    if ($opts['limit'] < 1) {
+        fail('--limit must be at least 1');
+    }
+    if ($opts['context'] < 0) {
+        fail('--context must be 0 or greater');
+    }
+    if ($opts['json'] && $opts['show'] !== null) {
+        fail('--json is only available in list mode (without --show)');
+    }
+
+    return $opts;
+}
+
+function escapeLike(string $value): string
+{
+    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $value);
+}
+
+function sinceEpochMs(?string $since): ?int
+{
+    if ($since === null) {
+        return null;
+    }
+    if (preg_match('/^-(\d+)d$/', $since, $m)) {
+        return (time() - ((int) $m[1] * 86400)) * 1000;
+    }
+    $ts = strtotime($since);
+    if ($ts === false) {
+        fail('Invalid date for --since: ' . $since . ' (YYYY-MM-DD or -Nd)');
+    }
+
+    return $ts * 1000;
+}
+
+function openDb(): PDO
+{
+    $path = null;
+
+    $out = @shell_exec('opencode db path 2>/dev/null');
+    if ($out !== null && $out !== false) {
+        $candidate = trim($out);
+        if ($candidate !== '' && is_file($candidate)) {
+            $path = $candidate;
+        }
+    }
+    $path ??= rtrim($_SERVER['HOME'] ?? '', '/') . '/.local/share/opencode/opencode.db';
+
+    if (!is_file($path)) {
+        fail('Opencode database not found: ' . $path);
+    }
+
+    $db = new PDO('sqlite:file:' . $path . '?mode=ro');
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+    return $db;
+}
+
+function filterSql(bool $textOnly, ?string $project, ?int $sinceMs): string
+{
+    $sql = '';
+    if ($textOnly) {
+        $sql .= " AND json_extract(p.data, '\$.type') = 'text'";
+    }
+    if ($project !== null) {
+        $sql .= ' AND s.directory LIKE :project ESCAPE \'\\\'';
+    }
+    if ($sinceMs !== null) {
+        $sql .= ' AND s.time_created >= :since';
+    }
+
+    return $sql;
+}
+
+function runList(array $opts, PDO $db): void
+{
+    $sinceMs = sinceEpochMs($opts['since']);
+
+    $sql = "SELECT s.id, s.title, s.directory, s.time_created, count(*) AS hits
+            FROM part p
+            JOIN session s ON s.id = p.session_id
+            WHERE p.data LIKE :kw ESCAPE '\\'";
+    $sql .= filterSql($opts['textOnly'], $opts['project'], $sinceMs);
+    $sql .= ' GROUP BY s.id
+             ORDER BY hits DESC, s.time_updated DESC
+             LIMIT ' . (int) $opts['limit'];
+
+    $stmt = $db->prepare($sql);
+    $stmt->bindValue(':kw', '%' . escapeLike($opts['keyword']) . '%', PDO::PARAM_STR);
+    if ($opts['project'] !== null) {
+        $stmt->bindValue(':project', '%' . escapeLike($opts['project']) . '%', PDO::PARAM_STR);
+    }
+    if ($sinceMs !== null) {
+        $stmt->bindValue(':since', $sinceMs, PDO::PARAM_INT);
+    }
+    $stmt->execute();
+
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if ($opts['json']) {
+        $sessions = array_map(static fn (array $r): array => [
+            'created'   => date('c', (int) ($r['time_created'] / 1000)),
+            'directory' => (string) $r['directory'],
+            'hits'      => (int) $r['hits'],
+            'id'        => (string) $r['id'],
+            'title'     => (string) $r['title'],
+        ], $rows);
+        echo json_encode([
+            'count'    => count($sessions),
+            'keyword'  => $opts['keyword'],
+            'sessions' => $sessions,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), "\n";
+
+        exit($rows ? 0 : 1);
+    }
+
+    if ($opts['quiet']) {
+        foreach ($rows as $row) {
+            echo $row['id'], "\n";
+        }
+
+        exit($rows ? 0 : 1);
+    }
+
+    if (!$rows) {
+        exit(1);
+    }
+
+    foreach ($rows as $row) {
+        echo str_pad((string) $row['hits'], 6, ' ', STR_PAD_LEFT), '  ',
+            date('Y-m-d H:i', (int) ($row['time_created'] / 1000)), '  ',
+            $row['id'], '  ',
+            $row['title'], "\n";
+        if ($opts['resume']) {
+            echo str_repeat(' ', 24), '→ opencode --session ', $row['id'], "\n";
+        }
+    }
+
+    exit(0);
+}
+
+function resolveSession(PDO $db, string $id): ?array
+{
+    $stmt = $db->prepare('SELECT id, title FROM session WHERE id = :id');
+    $stmt->execute([':id' => $id]);
+    if ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        return $row;
+    }
+    if (strlen($id) < 8) {
+        return null;
+    }
+
+    $stmt = $db->prepare('SELECT id, title FROM session WHERE id LIKE :prefix LIMIT 2');
+    $stmt->execute([':prefix' => $id . '%']);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    if (count($rows) === 1) {
+        return $rows[0];
+    }
+
+    fail(count($rows) === 0
+        ? 'Session not found: ' . $id
+        : 'Ambiguous session prefix: ' . $id);
+}
+
+function highlightLine(string $line, string $kw, bool $color): string
+{
+    if (!$color) {
+        return $line;
+    }
+
+    $out = '';
+    $pos = 0;
+    $kwl = mb_strlen($kw);
+    while (($i = mb_stripos($line, $kw, $pos)) !== false) {
+        $out .= mb_substr($line, $pos, $i - $pos);
+        $out .= "\033[1m" . mb_substr($line, $i, $kwl) . "\033[22m";
+        $pos = $i + $kwl;
+    }
+
+    return $out . mb_substr($line, $pos);
+}
+
+function clipLine(string $line): string
+{
+    $line = str_replace(["\r", "\t"], ' ', $line);
+    if (mb_strlen($line) <= MAX_LINE_WIDTH) {
+        return $line;
+    }
+
+    return mb_substr($line, 0, MAX_LINE_WIDTH) . '…';
+}
+
+function printWindows(array $lines, string $kw, int $context, bool $color): void
+{
+    $hits = [];
+    foreach ($lines as $idx => $line) {
+        if (stripos($line, $kw) !== false) {
+            $hits[] = $idx;
+        }
+    }
+
+    $windows = [];
+    foreach ($hits as $hit) {
+        $start = max(0, $hit - $context);
+        $end   = min(count($lines) - 1, $hit + $context);
+
+        if ($windows && $start <= $windows[count($windows) - 1][1] + 1) {
+            $windows[count($windows) - 1][1] = max($windows[count($windows) - 1][1], $end);
+        } else {
+            $windows[] = [$start, $end];
+        }
+    }
+
+    $width = (string) count($lines);
+    $last  = null;
+    foreach ($windows as [$start, $end]) {
+        if ($last !== null && $start > $last + 1) {
+            echo "      …\n";
+        }
+        for ($i = $start; $i <= $end; $i++) {
+            $line = $lines[$i];
+            $marker = stripos($line, $kw) !== false ? '>' : ' ';
+            echo '   ', $marker, ' ', str_pad((string) ($i + 1), strlen($width), ' ', STR_PAD_LEFT), '  ',
+                clipLine(highlightLine($line, $kw, $color)), "\n";
+        }
+        $last = $end;
+    }
+}
+
+function runShow(array $opts, PDO $db): void
+{
+    $session = resolveSession($db, $opts['show']);
+    if ($session === null) {
+        fail('Session not found: ' . $opts['show']);
+    }
+
+    $sinceMs = sinceEpochMs($opts['since']);
+
+    $sql = "SELECT p.id, p.data, p.time_created, json_extract(m.data, '\$.role') AS role
+            FROM part p
+            JOIN message m ON m.id = p.message_id
+            WHERE p.session_id = :sid AND p.data LIKE :kw ESCAPE '\\'";
+    if ($opts['textOnly']) {
+        $sql .= " AND json_extract(p.data, '\$.type') = 'text'";
+    }
+    if ($sinceMs !== null) {
+        $sql .= ' AND p.time_created >= :since';
+    }
+    $sql .= ' ORDER BY p.time_created';
+
+    $stmt = $db->prepare($sql);
+    $stmt->bindValue(':sid', $session['id'], PDO::PARAM_STR);
+    $stmt->bindValue(':kw', '%' . escapeLike($opts['keyword']) . '%', PDO::PARAM_STR);
+    if ($sinceMs !== null) {
+        $stmt->bindValue(':since', $sinceMs, PDO::PARAM_INT);
+    }
+    $stmt->execute();
+
+    $parts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    echo $session['id'], ' — ', $session['title'], "\n";
+    echo str_repeat('─', max(40, mb_strlen($session['id'] . ' — ' . $session['title']))), "\n";
+
+    if (!$parts) {
+        echo 'No matches in this session.', "\n";
+
+        exit(1);
+    }
+
+    $color = function_exists('stream_isatty') && @stream_isatty(STDOUT);
+    $shown = 0;
+    foreach ($parts as $part) {
+        $data = json_decode((string) $part['data'], true);
+        if (!is_array($data)) {
+            continue;
+        }
+
+        $type = (string) ($data['type'] ?? '');
+        $role = (string) ($part['role'] ?? '?');
+
+        if ($type === 'text') {
+            $text  = (string) ($data['text'] ?? '');
+            $label = $role;
+        } elseif ($type === 'tool') {
+            $text  = (string) ($data['state']['output'] ?? $data['state']['error'] ?? '');
+            $label = 'tool:' . (string) ($data['tool'] ?? '?');
+        } else {
+            $text  = (string) ($data['text'] ?? '');
+            $label = $type !== '' ? $type : $role;
+        }
+
+        if ($text === '') {
+            continue;
+        }
+
+        $shown++;
+        echo "\n[", date('Y-m-d H:i', (int) ($part['time_created'] / 1000)), '] ', $label, "\n";
+        printWindows(preg_split('/\n/', $text), (string) $opts['keyword'], $opts['context'], $color);
+    }
+
+    if ($shown === 0) {
+        echo 'No displayable matches (matches are in non-extractable parts).', "\n";
+    }
+
+    exit(0);
+}
+
+function main(array $argv): void
+{
+    $opts = parseArgs($argv);
+    $db   = openDb();
+
+    if ($opts['show'] !== null) {
+        runShow($opts, $db);
+    }
+
+    runList($opts, $db);
+}
+
+main($argv);
