@@ -46,6 +46,7 @@ Options:
       --json           Output as JSON (list mode only)
       --resume         Show the opencode --session command per session
   -q, --quiet          Print session IDs only
+  -V, --version        Print the version and exit
   -h, --help           This help
 
 Exit status:  0 = matches found, 1 = no matches, 2 = error

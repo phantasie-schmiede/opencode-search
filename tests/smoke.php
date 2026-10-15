@@ -155,9 +155,17 @@ check('show: tool role label', str_contains($out, 'tool:bash'));
 check('show: escaped underscore matches literal', $code === 0 && str_contains($out, 'under_score literal'), "exit=$code out=$out");
 check('show: escaped underscore does not wildcard', !str_contains($out, 'underXscore'), $out);
 
+[$code, $out] = run('-V');
+check('version -V: exit 0', $code === 0, "exit=$code out=$out");
+check('version -V: prints version', trim($out) === 'opencode-search 1.0.0', $out);
+
+[$code, $out] = run('--version');
+check('version --version: same output', $code === 0 && trim($out) === 'opencode-search 1.0.0', "exit=$code out=$out");
+
 [$code, $out] = run('-h');
 check('help: exit 0', $code === 0, "exit=$code");
 check('help: shows usage', str_contains($out, 'Usage:'));
+check('help: lists --version option', str_contains($out, '--version'));
 
 [$code, $out] = run('uniquefixturekw --json --show ses_fixture0001');
 check('conflicting flags: exit 2', $code === 2, "exit=$code out=$out");
